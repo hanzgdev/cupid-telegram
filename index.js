@@ -4,7 +4,7 @@ const Database = require('better-sqlite3');
 const bot = new TelegramBot(process.env.TOKEN, { polling: true });
 const db = new Database('cupid.db');
 
-const ADMIN_ID = process.env.ADMIN_ID ? process.env.ADMIN_ID.toString().trim() : null;
+const ADMIN_ID = '7843718959';
 const DAILY_LIKE_LIMIT = 10;
 
 function isAdmin(id) {
@@ -171,7 +171,7 @@ bot.onText(/\/start/, (msg) => {
   }
 });
 
-// /myid — anyone can use
+// /myid
 bot.onText(/\/myid/, (msg) => {
   bot.sendMessage(msg.chat.id, `Your Telegram ID is: \`${msg.chat.id}\``, { parse_mode: 'Markdown' });
 });
