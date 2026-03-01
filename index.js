@@ -1,11 +1,10 @@
-index.js
 const TelegramBot = require('node-telegram-bot-api');
 const Database = require('better-sqlite3');
 
 const bot = new TelegramBot(process.env.TOKEN, { polling: true });
 const db = new Database('cupid.db');
 
-const ADMIN_ID = parseInt(process.env.ADMIN_ID); // your telegram user id
+const ADMIN_ID = parseInt(process.env.ADMIN_ID);
 const DAILY_LIKE_LIMIT = 10;
 
 db.exec(`
@@ -44,18 +43,15 @@ const sessions = {};
 
 function mainMenu(userId) {
   const profile = db.prepare('SELECT is_vip FROM profiles WHERE user_id = ?').get(userId);
-  const isVip = profile?.is_vip === 1;
-
-  const keyboard = [
-    ['💘 Find a Match'],
-    ['👤 My Profile', '✏️ Edit Profile'],
-    ['💌 Who Liked Me', isVip ? '⭐ VIP Member' : '⭐ Get VIP'],
-    ['🗑️ Delete Profile']
-  ];
-
+  const vip = profile && profile.is_vip === 1;
   return {
     reply_markup: {
-      keyboard,
+      keyboard: [
+        ['💘 Find a Match'],
+        ['👤 My Profile', '✏️ Edit Profile'],
+        ['💌 Who Liked Me', vip ? '⭐ VIP Member' : '⭐ Get VIP'],
+        ['🗑️ Delete Profile']
+      ],
       resize_keyboard: true
     }
   };
@@ -63,18 +59,94 @@ function mainMenu(userId) {
 
 function isVip(userId) {
   const profile = db.prepare('SELECT is_vip FROM profiles WHERE user_id = ?').get(userId);
-  return profile?.is_vip === 1;
+  return profile && profile.is_vip === 1;
 }
 
 function isBanned(userId) {
   const profile = db.prepare('SELECT is_banned FROM profiles WHERE user_id = ?').get(userId);
-  return profile?.is_banned === 1;
+  return profile && profile.is_banned === 1;
 }
 
 function getLikesUsedToday(userId) {
   const since = Math.floor(Date.now() / 1000) - 86400;
   const row = db.prepare('SELECT COUNT(*) as count FROM likes WHERE from_id = ? AND created_at > ?').get(userId, since);
   return row.count;
+}
+
+function finishProfile(userId, username) {
+  const s = sessions[userId];
+  const existing = db.prepare('SELECT is_vip, boosted_until FROM profiles WHERE user_id = ?').get(userId);
+  db.prepare(`
+    INSERT OR REPLACE INTO profiles (user_id, username, name, age, gender, looking_for, bio, interests, photo_id, is_vip, boosted_until)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    userId,
+    username || null,
+    s.name,
+    s.age,
+    s.gender,
+    s.looking_for,
+    s.bio,
+    s.interests,
+    s.photo_id || null,
+    existing ? existing.is_vip : 0,
+    existing ? existing.boosted_until : 0
+  );
+  delete sessions[userId];
+}
+
+function showMatch(id) {
+  const me = db.prepare('SELECT * FROM profiles WHERE user_id = ?').get(id);
+  if (!me) {
+    return bot.sendMessage(id, 'You need a profile first!', {
+      reply_markup: { keyboard: [['💘 Create Profile']], resize_keyboard: true }
+    });
+  }
+
+  const genderFilter = me.looking_for === 'Everyone' ? '%' : me.looking_for.slice(0, -1);
+  const now = Math.floor(Date.now() / 1000);
+
+  const match = db.prepare(`
+    SELECT * FROM profiles
+    WHERE user_id != ?
+    AND is_banned = 0
+    AND gender LIKE ?
+    AND user_id NOT IN (SELECT to_id FROM likes WHERE from_id = ?)
+    AND user_id NOT IN (SELECT to_id FROM passes WHERE from_id = ?)
+    ORDER BY CASE WHEN boosted_until > ? THEN 0 ELSE 1 END, RANDOM()
+    LIMIT 1
+  `).get(id, genderFilter, id, id, now);
+
+  if (!match) {
+    return bot.sendMessage(id, '💔 No more matches right now! Check back later.', mainMenu(id));
+  }
+
+  db.prepare('INSERT OR REPLACE INTO last_seen (user_id, last_match_id) VALUES (?, ?)').run(id, match.user_id);
+
+  const vipBadge = match.is_vip ? '⭐ ' : '';
+  const caption =
+    `${vipBadge}💘 *${match.name}*, ${match.age}\n` +
+    `Bio: ${match.bio}\n` +
+    `Interests: ${match.interests}`;
+
+  const inlineKeyboard = [
+    [
+      { text: '❤️ Like', callback_data: `like_${match.user_id}` },
+      { text: '👎 Pass', callback_data: `pass_${match.user_id}` }
+    ]
+  ];
+
+  if (isVip(id)) {
+    inlineKeyboard.push([{ text: '↩️ Undo Last Pass', callback_data: 'undo' }]);
+  }
+
+  const buttons = { reply_markup: { inline_keyboard: inlineKeyboard } };
+
+  if (match.photo_id) {
+    bot.sendPhoto(id, match.photo_id, { caption, parse_mode: 'Markdown', ...buttons });
+  } else {
+    bot.sendMessage(id, caption, { parse_mode: 'Markdown', ...buttons });
+  }
 }
 
 // /start
@@ -86,7 +158,7 @@ bot.onText(/\/start/, (msg) => {
   if (profile) {
     bot.sendMessage(id, `Welcome back, ${profile.name}! 💘`, mainMenu(id));
   } else {
-    bot.sendMessage(id, `💘 Welcome to CupidBot!\n\nLet's set up your profile!`, {
+    bot.sendMessage(id, `💘 Welcome to CupidBot!\n\nLet's set up your profile first!`, {
       reply_markup: {
         keyboard: [['💘 Create Profile']],
         resize_keyboard: true
@@ -151,15 +223,29 @@ bot.onText(/\/stats/, (msg) => {
   );
 });
 
-// Message handler
+bot.onText(/\/myid/, (msg) => {
+  bot.sendMessage(msg.chat.id, `Your Telegram ID is: \`${msg.chat.id}\``, { parse_mode: 'Markdown' });
+});
+
+// Main message handler
 bot.on('message', async (msg) => {
   const id = msg.chat.id;
   if (isBanned(id)) return;
 
   const text = msg.text;
+  if (!text) {
+    const session = sessions[id];
+    if (session && session.step === 'photo' && msg.photo) {
+      sessions[id].photo_id = msg.photo[msg.photo.length - 1].file_id;
+      finishProfile(id, msg.from.username);
+      return bot.sendMessage(id, '✅ Profile saved! 💘', mainMenu(id));
+    }
+    return;
+  }
+
   const session = sessions[id] || {};
 
-  // --- Profile setup flow ---
+  // Profile setup flow
   if (text === '💘 Create Profile' || text === '✏️ Edit Profile') {
     sessions[id] = { step: 'name' };
     return bot.sendMessage(id, "What's your name?", { reply_markup: { remove_keyboard: true } });
@@ -221,22 +307,18 @@ bot.on('message', async (msg) => {
     });
   }
 
-  if (session.step === 'photo') {
-    sessions[id].photo_id = msg.photo ? msg.photo[msg.photo.length - 1].file_id : null;
-    finishProfile(id, msg.from.username);
-    return bot.sendMessage(id, '✅ Profile saved! 💘', mainMenu(id));
-  }
-
   if (text === '⏭️ Skip Photo' && session.step === 'photo') {
     sessions[id].photo_id = null;
     finishProfile(id, msg.from.username);
     return bot.sendMessage(id, '✅ Profile saved! 💘', mainMenu(id));
   }
 
-  // --- My Profile ---
+  // Main menu buttons
   if (text === '👤 My Profile') {
     const profile = db.prepare('SELECT * FROM profiles WHERE user_id = ?').get(id);
-    if (!profile) return bot.sendMessage(id, "No profile yet!", { reply_markup: { keyboard: [['💘 Create Profile']], resize_keyboard: true } });
+    if (!profile) return bot.sendMessage(id, "No profile yet! Use Create Profile.", {
+      reply_markup: { keyboard: [['💘 Create Profile']], resize_keyboard: true }
+    });
 
     const vipBadge = profile.is_vip ? '⭐ VIP\n' : '';
     const caption =
@@ -253,15 +335,14 @@ bot.on('message', async (msg) => {
     }
   }
 
-  // --- Find a Match ---
   if (text === '💘 Find a Match') {
     if (!isVip(id)) {
       const used = getLikesUsedToday(id);
       if (used >= DAILY_LIKE_LIMIT) {
         return bot.sendMessage(id,
           `❤️ You've used all ${DAILY_LIKE_LIMIT} free likes today!\n\n` +
-          `⭐ Get VIP for unlimited likes and more perks!\n` +
-          `Contact @YourUsername to upgrade.`,
+          `⭐ Get VIP for unlimited likes!\n` +
+          `Tap the ⭐ Get VIP button below.`,
           mainMenu(id)
         );
       }
@@ -269,11 +350,10 @@ bot.on('message', async (msg) => {
     showMatch(id);
   }
 
-  // --- Who Liked Me ---
   if (text === '💌 Who Liked Me') {
     if (!isVip(id)) {
       return bot.sendMessage(id,
-        `⭐ *VIP Feature*\n\nSee everyone who liked your profile!\n\nContact @YourUsername to get VIP 💘`,
+        `⭐ *VIP Feature*\n\nSee everyone who liked your profile!\n\nTap ⭐ Get VIP to unlock this.`,
         { parse_mode: 'Markdown', ...mainMenu(id) }
       );
     }
@@ -294,16 +374,15 @@ bot.on('message', async (msg) => {
     bot.sendMessage(id, `*People who liked you:*\n\n${list}`, { parse_mode: 'Markdown', ...mainMenu(id) });
   }
 
-  // --- VIP info ---
   if (text === '⭐ Get VIP' || text === '⭐ VIP Member') {
     if (isVip(id)) {
       return bot.sendMessage(id,
         `⭐ *You are a VIP member!*\n\n` +
         `Your perks:\n` +
-        `• Unlimited likes\n` +
-        `• See who liked you\n` +
-        `• Undo last pass\n` +
-        `• Boosted profile in matches`,
+        `• ♾️ Unlimited likes\n` +
+        `• 💌 See who liked you\n` +
+        `• ↩️ Undo last pass\n` +
+        `• 🚀 Boosted profile in matches`,
         { parse_mode: 'Markdown', ...mainMenu(id) }
       );
     }
@@ -314,14 +393,13 @@ bot.on('message', async (msg) => {
       `• 💌 See who liked you\n` +
       `• ↩️ Undo last pass\n` +
       `• 🚀 Boosted profile in matches\n\n` +
-      `Contact *@YourUsername* to upgrade! 💘`,
+      `To get VIP type /myid and send your ID to the admin!`,
       { parse_mode: 'Markdown', ...mainMenu(id) }
     );
   }
 
-  // --- Delete Profile ---
   if (text === '🗑️ Delete Profile') {
-    bot.sendMessage(id, 'Are you sure?', {
+    bot.sendMessage(id, 'Are you sure you want to delete your profile?', {
       reply_markup: {
         keyboard: [['✅ Yes, Delete', '❌ No, Go Back']],
         one_time_keyboard: true,
@@ -334,7 +412,9 @@ bot.on('message', async (msg) => {
     db.prepare('DELETE FROM profiles WHERE user_id = ?').run(id);
     db.prepare('DELETE FROM likes WHERE from_id = ? OR to_id = ?').run(id, id);
     db.prepare('DELETE FROM passes WHERE from_id = ? OR to_id = ?').run(id, id);
-    bot.sendMessage(id, '💔 Profile deleted.', { reply_markup: { keyboard: [['💘 Create Profile']], resize_keyboard: true } });
+    bot.sendMessage(id, '💔 Profile deleted.', {
+      reply_markup: { keyboard: [['💘 Create Profile']], resize_keyboard: true }
+    });
   }
 
   if (text === '❌ No, Go Back') {
@@ -342,60 +422,7 @@ bot.on('message', async (msg) => {
   }
 });
 
-// Show match
-function showMatch(id) {
-  const me = db.prepare('SELECT * FROM profiles WHERE user_id = ?').get(id);
-  if (!me) return bot.sendMessage(id, 'You need a profile first!');
-
-  const genderFilter = me.looking_for === 'Everyone' ? '%' : me.looking_for.slice(0, -1);
-  const now = Math.floor(Date.now() / 1000);
-
-  // Boosted VIP profiles show up first
-  const match = db.prepare(`
-    SELECT * FROM profiles
-    WHERE user_id != ?
-    AND is_banned = 0
-    AND gender LIKE ?
-    AND user_id NOT IN (SELECT to_id FROM likes WHERE from_id = ?)
-    AND user_id NOT IN (SELECT to_id FROM passes WHERE from_id = ?)
-    ORDER BY CASE WHEN boosted_until > ? THEN 0 ELSE 1 END, RANDOM()
-    LIMIT 1
-  `).get(id, genderFilter, id, id, now);
-
-  if (!match) return bot.sendMessage(id, "💔 No more matches right now! Check back later.", mainMenu(id));
-
-  db.prepare('INSERT OR REPLACE INTO last_seen (user_id, last_match_id) VALUES (?, ?)').run(id, match.user_id);
-
-  const vipBadge = match.is_vip ? '⭐ ' : '';
-  const caption =
-    `${vipBadge}💘 *${match.name}*, ${match.age}\n` +
-    `Bio: ${match.bio}\n` +
-    `Interests: ${match.interests}`;
-
-  const undoButton = isVip(id)
-    ? [{ text: '↩️ Undo', callback_data: 'undo' }]
-    : [];
-
-  const buttons = {
-    reply_markup: {
-      inline_keyboard: [
-        [
-          { text: '❤️ Like', callback_data: `like_${match.user_id}` },
-          { text: '👎 Pass', callback_data: `pass_${match.user_id}` }
-        ],
-        undoButton
-      ].filter(row => row.length > 0)
-    }
-  };
-
-  if (match.photo_id) {
-    bot.sendPhoto(id, match.photo_id, { caption, parse_mode: 'Markdown', ...buttons });
-  } else {
-    bot.sendMessage(id, caption, { parse_mode: 'Markdown', ...buttons });
-  }
-}
-
-// Like / Pass / Undo
+// Like / Pass / Undo buttons
 bot.on('callback_query', async (query) => {
   const fromId = query.from.id;
   const data = query.data;
@@ -406,8 +433,10 @@ bot.on('callback_query', async (query) => {
     if (!isVip(fromId)) {
       const used = getLikesUsedToday(fromId);
       if (used >= DAILY_LIKE_LIMIT) {
-        bot.answerCallbackQuery(query.id, { text: `❤️ Out of likes for today! Get VIP for unlimited.`, show_alert: true });
-        return;
+        return bot.answerCallbackQuery(query.id, {
+          text: `❤️ Out of likes for today! Get VIP for unlimited.`,
+          show_alert: true
+        });
       }
     }
 
@@ -422,10 +451,16 @@ bot.on('callback_query', async (query) => {
       const meLink = me.username ? `@${me.username}` : `[${me.name}](tg://user?id=${fromId})`;
       const themLink = them.username ? `@${them.username}` : `[${them.name}](tg://user?id=${toId})`;
 
-      bot.sendMessage(fromId, `🎉 *It's a match!*\n\nYou and ${themLink} liked each other!\nTap their name to start chatting 💬`, { parse_mode: 'Markdown', ...mainMenu(fromId) });
-      bot.sendMessage(toId, `🎉 *It's a match!*\n\nYou and ${meLink} liked each other!\nTap their name to start chatting 💬`, { parse_mode: 'Markdown', ...mainMenu(toId) });
+      bot.sendMessage(fromId,
+        `🎉 *It's a match!*\n\nYou and ${themLink} liked each other!\nTap their name to start chatting 💬`,
+        { parse_mode: 'Markdown', ...mainMenu(fromId) }
+      );
+      bot.sendMessage(toId,
+        `🎉 *It's a match!*\n\nYou and ${meLink} liked each other!\nTap their name to start chatting 💬`,
+        { parse_mode: 'Markdown', ...mainMenu(toId) }
+      );
     } else {
-      bot.answerCallbackQuery(query.id, { text: '❤️ Liked!' });
+      bot.answerCallbackQuery(query.id, { text: '❤️ Liked! Keep swiping...' });
       showMatch(fromId);
     }
   }
@@ -453,16 +488,5 @@ bot.on('callback_query', async (query) => {
     showMatch(fromId);
   }
 });
-
-function finishProfile(userId, username) {
-  const s = sessions[userId];
-  const existing = db.prepare('SELECT is_vip, boosted_until FROM profiles WHERE user_id = ?').get(userId);
-  db.prepare(`
-    INSERT OR REPLACE INTO profiles (user_id, username, name, age, gender, looking_for, bio, interests, photo_id, is_vip, boosted_until)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(userId, username || null, s.name, s.age, s.gender, s.looking_for, s.bio, s.interests, s.photo_id,
-    existing?.is_vip || 0, existing?.boosted_until || 0);
-  delete sessions[userId];
-}
 
 console.log('CupidBot is running!');
