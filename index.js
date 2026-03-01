@@ -4,8 +4,12 @@ const Database = require('better-sqlite3');
 const bot = new TelegramBot(process.env.TOKEN, { polling: true });
 const db = new Database('cupid.db');
 
-const ADMIN_ID = parseInt(process.env.ADMIN_ID);
+const ADMIN_ID = process.env.ADMIN_ID ? process.env.ADMIN_ID.toString().trim() : null;
 const DAILY_LIKE_LIMIT = 10;
+
+function isAdmin(id) {
+  return id.toString().trim() === ADMIN_ID;
+}
 
 db.exec(`
   CREATE TABLE IF NOT EXISTS profiles (
@@ -167,53 +171,60 @@ bot.onText(/\/start/, (msg) => {
   }
 });
 
+// /myid — anyone can use
+bot.onText(/\/myid/, (msg) => {
+  bot.sendMessage(msg.chat.id, `Your Telegram ID is: \`${msg.chat.id}\``, { parse_mode: 'Markdown' });
+});
+
 // Admin commands
-bot.onText(/\/grantvip (\d+)/, (msg, match) => {
-  if (msg.from.id !== ADMIN_ID) return;
-  const targetId = parseInt(match[1]);
+bot.onText(/\/grantvip (.+)/, (msg, match) => {
+  if (!isAdmin(msg.from.id)) return;
+  const targetId = parseInt(match[1].trim());
   db.prepare('UPDATE profiles SET is_vip = 1 WHERE user_id = ?').run(targetId);
-  bot.sendMessage(ADMIN_ID, `✅ VIP granted to user ${targetId}`);
-  bot.sendMessage(targetId,
-    `⭐ *You are now a VIP member!*\n\n` +
-    `You now have access to:\n` +
-    `• Unlimited likes\n` +
-    `• See who liked you\n` +
-    `• Undo last pass\n` +
-    `• Boosted profile in matches\n\n` +
-    `Enjoy! 💘`,
-    { parse_mode: 'Markdown' }
-  );
+  bot.sendMessage(msg.chat.id, `✅ VIP granted to user ${targetId}`);
+  try {
+    bot.sendMessage(targetId,
+      `⭐ *You are now a VIP member!*\n\n` +
+      `You now have access to:\n` +
+      `• Unlimited likes\n` +
+      `• See who liked you\n` +
+      `• Undo last pass\n` +
+      `• Boosted profile in matches\n\n` +
+      `Enjoy! 💘`,
+      { parse_mode: 'Markdown' }
+    );
+  } catch (e) {}
 });
 
-bot.onText(/\/removevip (\d+)/, (msg, match) => {
-  if (msg.from.id !== ADMIN_ID) return;
-  const targetId = parseInt(match[1]);
+bot.onText(/\/removevip (.+)/, (msg, match) => {
+  if (!isAdmin(msg.from.id)) return;
+  const targetId = parseInt(match[1].trim());
   db.prepare('UPDATE profiles SET is_vip = 0 WHERE user_id = ?').run(targetId);
-  bot.sendMessage(ADMIN_ID, `✅ VIP removed from user ${targetId}`);
-  bot.sendMessage(targetId, `Your VIP membership has ended. Contact us to renew! 💔`);
+  bot.sendMessage(msg.chat.id, `✅ VIP removed from user ${targetId}`);
+  try { bot.sendMessage(targetId, `Your VIP membership has ended. Contact us to renew! 💔`); } catch (e) {}
 });
 
-bot.onText(/\/ban (\d+)/, (msg, match) => {
-  if (msg.from.id !== ADMIN_ID) return;
-  const targetId = parseInt(match[1]);
+bot.onText(/\/ban (.+)/, (msg, match) => {
+  if (!isAdmin(msg.from.id)) return;
+  const targetId = parseInt(match[1].trim());
   db.prepare('UPDATE profiles SET is_banned = 1 WHERE user_id = ?').run(targetId);
-  bot.sendMessage(ADMIN_ID, `✅ User ${targetId} has been banned`);
+  bot.sendMessage(msg.chat.id, `✅ User ${targetId} has been banned`);
 });
 
-bot.onText(/\/unban (\d+)/, (msg, match) => {
-  if (msg.from.id !== ADMIN_ID) return;
-  const targetId = parseInt(match[1]);
+bot.onText(/\/unban (.+)/, (msg, match) => {
+  if (!isAdmin(msg.from.id)) return;
+  const targetId = parseInt(match[1].trim());
   db.prepare('UPDATE profiles SET is_banned = 0 WHERE user_id = ?').run(targetId);
-  bot.sendMessage(ADMIN_ID, `✅ User ${targetId} has been unbanned`);
+  bot.sendMessage(msg.chat.id, `✅ User ${targetId} has been unbanned`);
 });
 
 bot.onText(/\/stats/, (msg) => {
-  if (msg.from.id !== ADMIN_ID) return;
+  if (!isAdmin(msg.from.id)) return;
   const total = db.prepare('SELECT COUNT(*) as count FROM profiles').get().count;
   const vips = db.prepare('SELECT COUNT(*) as count FROM profiles WHERE is_vip = 1').get().count;
   const banned = db.prepare('SELECT COUNT(*) as count FROM profiles WHERE is_banned = 1').get().count;
   const likes = db.prepare('SELECT COUNT(*) as count FROM likes').get().count;
-  bot.sendMessage(ADMIN_ID,
+  bot.sendMessage(msg.chat.id,
     `📊 *Bot Stats*\n\n` +
     `👤 Total users: ${total}\n` +
     `⭐ VIP users: ${vips}\n` +
@@ -221,10 +232,6 @@ bot.onText(/\/stats/, (msg) => {
     `❤️ Total likes: ${likes}`,
     { parse_mode: 'Markdown' }
   );
-});
-
-bot.onText(/\/myid/, (msg) => {
-  bot.sendMessage(msg.chat.id, `Your Telegram ID is: \`${msg.chat.id}\``, { parse_mode: 'Markdown' });
 });
 
 // Main message handler
@@ -245,7 +252,6 @@ bot.on('message', async (msg) => {
 
   const session = sessions[id] || {};
 
-  // Profile setup flow
   if (text === '💘 Create Profile' || text === '✏️ Edit Profile') {
     sessions[id] = { step: 'name' };
     return bot.sendMessage(id, "What's your name?", { reply_markup: { remove_keyboard: true } });
@@ -313,10 +319,9 @@ bot.on('message', async (msg) => {
     return bot.sendMessage(id, '✅ Profile saved! 💘', mainMenu(id));
   }
 
-  // Main menu buttons
   if (text === '👤 My Profile') {
     const profile = db.prepare('SELECT * FROM profiles WHERE user_id = ?').get(id);
-    if (!profile) return bot.sendMessage(id, "No profile yet! Use Create Profile.", {
+    if (!profile) return bot.sendMessage(id, "No profile yet!", {
       reply_markup: { keyboard: [['💘 Create Profile']], resize_keyboard: true }
     });
 
@@ -393,7 +398,7 @@ bot.on('message', async (msg) => {
       `• 💌 See who liked you\n` +
       `• ↩️ Undo last pass\n` +
       `• 🚀 Boosted profile in matches\n\n` +
-      `To get VIP type /myid and send your ID to the admin!`,
+      `Type /myid and send your ID to the admin to upgrade! 💘`,
       { parse_mode: 'Markdown', ...mainMenu(id) }
     );
   }
@@ -422,7 +427,7 @@ bot.on('message', async (msg) => {
   }
 });
 
-// Like / Pass / Undo buttons
+// Like / Pass / Undo
 bot.on('callback_query', async (query) => {
   const fromId = query.from.id;
   const data = query.data;
